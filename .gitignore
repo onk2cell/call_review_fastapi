@@ -2,3 +2,11 @@ venv/
 __pycache__/
 *.pyc
 .env
+
+# Ignore downloaded audio files so the client starts with a clean slate
+audio_files/
+*.wav
+*.mp3
+
+# Ignore Mac system files
+.DS_Store
