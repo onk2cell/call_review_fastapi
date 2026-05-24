@@ -127,13 +127,13 @@ def _build_rating_messages(rubric: str, aligned: str, english: str) -> list[dict
 
         JSON schema you MUST follow:
         {
-            "overall_score": <integer 0-100>,
+            "overall_score": <integer 0-5>,
             "grade":         <"A" | "B" | "C" | "D" | "F">,
             "summary":       <one-sentence overall verdict>,
             "criteria": [
                 {
                     "name":     <criterion name from rubric>,
-                    "score":    <integer 0-100>,
+                    "score":    <integer 0-5>,
                     "feedback": <one or two sentences>
                 }
             ],
