@@ -1,8 +1,10 @@
 import os
+import base64
 from pathlib import Path
 from typing import Any, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from groq import APIStatusError, Groq
+
+import requests
 
 from aligned_transcript import align_combined_data
 
@@ -81,44 +83,92 @@ def run_diarization(
 
 
 # ---------------------------------------------------------------------------
-# Transcription
+# Transcription (RunPod serverless Whisper)
 # ---------------------------------------------------------------------------
 
-def run_groq_translate_words(
-    groq_key: str,
+def _runpod_segments_words(output: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Flatten a RunPod faster-whisper ``segments`` list into the
+    ``{"text", "start", "end"}`` word format the aligner expects.
+
+    Prefers per-word timestamps (``word_timestamps=True``); falls back to
+    one pseudo-word per segment when only segment-level timing is present.
+    """
+    segments = output.get("segments") or []
+    out: list[dict[str, Any]] = []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        seg_words = seg.get("words") or []
+        if seg_words:
+            for w in seg_words:
+                if not isinstance(w, dict):
+                    continue
+                t = str(w.get("word") or w.get("text") or "").strip()
+                if t and w.get("start") is not None and w.get("end") is not None:
+                    out.append({"text": t, "start": float(w["start"]), "end": float(w["end"])})
+        else:
+            t = str(seg.get("text") or "").strip()
+            if t and seg.get("start") is not None and seg.get("end") is not None:
+                out.append({"text": t, "start": float(seg["start"]), "end": float(seg["end"])})
+    return out
+
+
+def run_runpod_translate_words(
+    runpod_key: str,
+    endpoint_id: str,
     audio_path: Path,
 ) -> tuple[list[dict[str, Any]], str]:
-    client = Groq(api_key=groq_key)
+    """
+    Transcribe + translate to English via a RunPod serverless Whisper endpoint.
 
+    Sends the audio as base64 to the endpoint's ``/runsync`` route (blocking,
+    returns the result in one call). Assumes the faster-whisper worker schema
+    (runpod-workers/worker-faster_whisper); adjust the ``input`` keys below if
+    your endpoint uses a different handler.
+    """
     with open(audio_path, "rb") as f:
-        audio_bytes = f.read()
+        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-    file_arg = (audio_path.name, audio_bytes)
-    base_kw: dict[str, Any] = {
-        "file": file_arg,
-        "model": "whisper-large-v3",
-        "response_format": "verbose_json",
+    url = f"https://api.runpod.ai/v2/{endpoint_id}/runsync"
+    headers = {
+        "Authorization": f"Bearer {runpod_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "input": {
+            "audio_base64": audio_b64,
+            "model": "large-v3",
+            "translate": True,            # -> English (matches Groq translations behaviour)
+            "word_timestamps": True,
+            "transcription": "plain_text",
+        }
     }
 
-    try:
-        tr = client.audio.translations.create(
-            **base_kw,
-            extra_body={"timestamp_granularities": ["word", "segment"]},
-        )
-    except APIStatusError as e:
-        if getattr(e, "status_code", None) not in (400, 422):
-            raise
-        tr = client.audio.translations.create(**base_kw)
+    resp = requests.post(url, headers=headers, json=payload, timeout=600)
+    resp.raise_for_status()
+    body = resp.json()
 
-    words = _verbose_json_to_words(tr)
+    status = body.get("status")
+    if status and status not in ("COMPLETED", "IN_PROGRESS"):
+        raise RuntimeError(f"RunPod job failed: {body}")
+
+    output = body.get("output") or {}
+    if isinstance(output, list):  # some workers return a list of results
+        output = output[0] if output else {}
+
+    words = _runpod_segments_words(output)
     if not words:
-        words = _segments_to_pseudo_words(tr)
+        words = _verbose_json_to_words(output)  # in case top-level "words" is present
 
-    text = getattr(tr, "text", None) or ""
-    if not text and hasattr(tr, "model_dump"):
-        text = str(tr.model_dump().get("text") or "")
+    text = str(
+        output.get("translation")
+        or output.get("transcription")
+        or output.get("text")
+        or ""
+    ).strip()
 
-    return words, text.strip()
+    return words, text
 
 
 # ---------------------------------------------------------------------------
@@ -146,13 +196,16 @@ def process_call_recording(
         transcription (10-40s)   ← runs at the same time as diarization
         alignment (1-3s)         ← starts once both finish
     """
-    pyannote_key = os.getenv("PYANNOTE_API_KEY")
-    groq_key     = os.getenv("GROQ_API_KEY")
+    pyannote_key        = os.getenv("PYANNOTE_API_KEY")
+    runpod_key          = os.getenv("RUNPOD_API_KEY")
+    runpod_endpoint_id  = os.getenv("RUNPOD_ENDPOINT_ID")
 
     if not pyannote_key:
         raise ValueError("Set PYANNOTE_API_KEY in .env")
-    if not groq_key:
-        raise ValueError("Set GROQ_API_KEY in .env")
+    if not runpod_key:
+        raise ValueError("Set RUNPOD_API_KEY in .env")
+    if not runpod_endpoint_id:
+        raise ValueError("Set RUNPOD_ENDPOINT_ID in .env")
 
     if on_stage:
         on_stage("processing_diarization")  # signals both are starting
@@ -163,7 +216,7 @@ def process_call_recording(
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         fut_diar  = pool.submit(run_diarization, pyannote_key, audio_url, audio_path, num_speakers)
-        fut_trans = pool.submit(run_groq_translate_words, groq_key, audio_path)
+        fut_trans = pool.submit(run_runpod_translate_words, runpod_key, runpod_endpoint_id, audio_path)
 
         # Collect results as they finish; update stage when transcription done
         for fut in as_completed([fut_diar, fut_trans]):
