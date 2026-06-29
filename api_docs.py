@@ -13,7 +13,7 @@ LANDING_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Call Review AI — Documentation</title>
+<title>JAM Call Review AI — Documentation</title>
 <style>
   :root{
     --bg:#f7f8fb; --panel:#ffffff; --ink:#1f2733; --muted:#64748b; --line:#e6e9ef;
@@ -108,7 +108,7 @@ LANDING_HTML = r"""<!doctype html>
 <body>
 <div class="wrap">
   <nav class="side">
-    <div class="brand">📞 Call Review AI</div>
+    <div class="brand">📞 JAM Call Review AI</div>
     <a href="#overview">Overview</a>
     <a href="#who">Who it's for</a>
     <a href="#how">How it works</a>
@@ -126,7 +126,7 @@ LANDING_HTML = r"""<!doctype html>
 
   <main>
     <div class="hero">
-      <h1>Call Review AI</h1>
+      <h1>JAM Call Review AI</h1>
       <p>Turn raw call recordings into clean, English transcripts with speaker labels — and an automatic quality score against your own checklist. Built for sales &amp; support call QA.</p>
       <div class="cta">
         <a href="/docs">▶ Interactive API (try it live)</a>
@@ -380,7 +380,10 @@ curl -X PUT http://localhost:8000/prompts/PROMPT_ID \
       <p>The interactive playground is at <a href="/docs">/docs</a> (Swagger) — fill in a request and hit <b>Execute</b>.</p>
     </section>
 
-    <footer>Call Review AI · Interactive API: <a href="/docs">/docs</a> · Admin: <a href="/admin">/admin</a></footer>
+    <footer>
+      JAM Call Review AI · Interactive API: <a href="/docs">/docs</a> · Admin: <a href="/admin">/admin</a><br>
+      Developed by <b>Onkar S Game</b> · Made with ❤️ from Onkar :)
+    </footer>
   </main>
 </div>
 

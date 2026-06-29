@@ -27,7 +27,7 @@ from fastapi.responses import HTMLResponse
 Base.metadata.create_all(bind=engine)
 ensure_audio_records_schema()
 
-app = FastAPI(title="Audio Transcription API")
+app = FastAPI(title="JAM Call Review AI")
 
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
@@ -1323,7 +1323,7 @@ def admin_page(_: str = Depends(admin_core.require_admin)):
 
 
 _ADMIN_HTML = """<!doctype html>
-<html><head><meta charset="utf-8"><title>Call Review — Admin</title>
+<html><head><meta charset="utf-8"><title>JAM Call Review AI — Admin</title>
 <style>
  body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:0;background:#0f172a;color:#e2e8f0}
  .wrap{max-width:880px;margin:0 auto;padding:24px}
@@ -1342,7 +1342,7 @@ _ADMIN_HTML = """<!doctype html>
  #msg{font-size:13px;margin-left:10px}
 </style></head>
 <body><div class="wrap">
- <h1>Call Review — Admin</h1>
+ <h1>JAM Call Review AI — Admin</h1>
  <div class="sub">Usage dashboard &amp; model selection</div>
 
  <div class="cards" id="cards"></div>
