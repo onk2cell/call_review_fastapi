@@ -1,28 +1,30 @@
 # AI Call Review & Transcription API
 
-An AI-powered FastAPI backend for automated call transcription, speaker diarization, and multilingual audio processing using Groq Whisper and PyAnnote.
+An AI-powered FastAPI backend for automated call transcription, speaker diarization, multilingual translation, and call-quality scoring.
 
-This project processes call recordings from local uploads, HTTP URLs, or AWS S3 links and generates structured transcripts with speaker separation for call review systems, CRM integrations, and quality monitoring platforms.
+It processes call recordings (local path, HTTP URL, or AWS S3) and produces a diarized English transcript plus a rubric-based QA score. There are **two interchangeable processing vendors**, selectable per request:
+
+- **Groq vendor** — PyAnnote diarization + RunPod/Groq Whisper transcription + Groq LLM scoring (parallel pipeline).
+- **Gemini vendor** — a single Gemini call does transcription + diarization + English translation, then a cheap text-only Gemini call scores the transcript. No PyAnnote/Whisper needed. Includes silence-trimming and per-call token tracking.
+
+It also ships an **admin dashboard** for usage metrics and live model selection, and a **prompt builder** that turns a PDF or rubric file into a scoring prompt.
 
 ---
 
 ## Features
 
 - FastAPI-based REST API
-- AI-powered transcription using Groq Whisper Large V3
-- Speaker diarization using PyAnnote
-- Parallel audio processing pipeline
-- Supports:
-  - Local audio uploads
-  - Public audio URLs
-  - AWS S3 audio files
-- Background task processing
-- Processing status tracking
-- PostgreSQL database integration
-- Pagination support
-- Webhook notification support
-- Automatic transcript alignment
-- Docker-ready backend structure
+- **Two vendors** (Groq or Gemini) selectable per `/process-audio` request
+- **Gemini single-call** transcription + diarization + translation + scoring
+- Groq Whisper / PyAnnote pipeline with automatic transcript alignment
+- **PDF / rubric → scoring prompt** generation (`/prompts/from-file`), with draft → verify-in-place workflow
+- **Admin dashboard** (`/admin`): live model catalog, vendor/model selection, usage metrics (tokens, call-minutes) — Basic-auth from `.env`
+- Per-call **token usage** stored in the DB
+- Silence-trimming for Gemini (lower audio token cost)
+- Sources: local path, public HTTP/HTTPS URL, AWS S3
+- Background task processing, status tracking, webhook notifications
+- PostgreSQL + pagination
+- Docker-ready (app + Postgres via `docker compose`)
 
 ---
 
@@ -37,10 +39,11 @@ This project processes call recordings from local uploads, HTTP URLs, or AWS S3 
 
 ### AI & Audio Processing
 
-- Groq Whisper Large V3
-- PyAnnote AI
-- FFmpeg
-- Pydub
+- Google Gemini (transcription + diarization + translation + scoring)
+- Groq Whisper Large V3 / Groq LLM scoring
+- PyAnnote AI (diarization)
+- FFmpeg + Pydub (silence-trim)
+- pymupdf4llm (PDF → markdown for prompt building)
 
 ### Cloud & Storage
 
@@ -53,13 +56,18 @@ This project processes call recordings from local uploads, HTTP URLs, or AWS S3 
 
 ```bash
 .
-├── main.py                     # FastAPI application entry point
-├── call_audio_pipeline.py      # Audio processing pipeline
+├── main.py                     # FastAPI app + routes (process-audio, prompts, admin)
+├── call_audio_pipeline.py      # Groq vendor pipeline (PyAnnote + RunPod/Whisper)
 ├── aligned_transcript.py       # Transcript alignment logic
-├── database.py                 # Database configuration
+├── gemini_pipeline.py          # Gemini vendor: transcribe/diarize/translate + rating
+├── prompt_builder.py           # PDF/rubric -> Gemini-drafted scoring prompt
+├── admin_core.py               # Admin settings store, live model catalog, auth
+├── database.py                 # DB config + idempotent schema migration
 ├── models.py                   # SQLAlchemy models
 ├── requirements.txt            # Project dependencies
-└── .env                        # Environment variables
+├── Dockerfile                  # App image (Python + ffmpeg)
+├── docker-compose.yml          # App + Postgres
+└── .env                        # Environment variables (not committed)
 ```
 
 ---
@@ -111,13 +119,23 @@ Create a `.env` file:
 
 ```env
 # Database
-DATABASE_URL=postgresql://username:password@localhost/db_name
+DATABASE_URL=postgresql://username:password@localhost:5432/db_name
 
-# Groq API
+# Gemini vendor
+GEMINI_API_KEY=your_gemini_api_key
+GEMINI_MODEL=gemini-2.5-flash-lite      # default Gemini model
+
+# Groq vendor
 GROQ_API_KEY=your_groq_api_key
 
-# PyAnnote
+# Groq-vendor diarization + transcription
 PYANNOTE_API_KEY=your_pyannote_api_key
+RUNPOD_API_KEY=your_runpod_api_key
+RUNPOD_ENDPOINT_ID=your_runpod_endpoint_id
+
+# Admin dashboard login (/admin)
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=change_me
 
 # AWS S3 (Optional)
 AWS_ACCESS_KEY_ID=your_access_key
@@ -127,6 +145,8 @@ AWS_REGION=ap-south-1
 # Storage
 AUDIO_STORAGE_DIR=audio_files
 ```
+
+> `.env` is git-ignored — never commit your keys.
 
 ---
 
@@ -148,52 +168,82 @@ gunicorn -k uvicorn.workers.UvicornWorker main:app
 
 ## API Endpoints
 
-### Upload & Process Audio
+### Process audio (choose vendor)
 
 ```http
-POST /process-audio
+POST /process-audio/
 ```
 
-Supports:
+```json
+{
+  "vendor": "gemini",                       // "groq" (default) or "gemini"
+  "gemini_model": "gemini-2.5-flash-lite",  // optional per-request override
+  "prompt_id": "<verified prompt id>",
+  "audio_sources": [
+    { "audio_id": "call_01", "source": "C:\\path\\to\\call.wav" }
+  ],
+  "notify_url": null
+}
+```
 
-- File upload
-- Audio URL
-- S3 audio links
+- `vendor` / `gemini_model` fall back to the admin dashboard settings, then to defaults.
+- `source` may be a local path, HTTP/HTTPS URL, or `s3://` URI.
+- Returns immediately; jobs run in the background.
 
----
-
-### Check Processing Status
+### Check status / results
 
 ```http
 GET /status/{audio_id}
 ```
 
-Returns:
+Returns phase (`pending → processing_audio → processing_rating → completed`, or the
+Groq-vendor phases), and once complete: `transcript`, `rating_json`, token `usage`,
+`vendor`, `gemini_model`.
 
-- Current processing stage
-- Transcript status
-- Error details (if any)
-
----
-
-### Get Audio Records
+### Prompts (PDF / rubric → scoring prompt)
 
 ```http
-GET /records
+POST /prompts/from-file     # upload a PDF or .md/.txt -> Gemini drafts a prompt (status=draft)
+GET  /prompts/{prompt_id}   # review
+PUT  /prompts/{prompt_id}   # edit/approve IN PLACE (same prompt_id; set status=verified)
+POST /prompts/              # legacy: upload a .md prompt directly
+GET  /prompts/              # paginated list
 ```
 
-Paginated API for retrieving processed audio records.
+### Admin (Basic auth from `.env`)
+
+```http
+GET  /admin                 # HTML dashboard (usage metrics + model selection)
+GET  /admin/models          # live model catalog (gemini + groq)
+GET  /admin/settings        # current vendor + per-vendor model
+POST /admin/settings        # set active_vendor / gemini_model / groq_model
+GET  /admin/dashboard       # JSON aggregates (jobs, call-minutes, tokens)
+```
+
+### Audio records
+
+```http
+GET /audio-ids/             # list audio ids + status
+```
 
 ---
 
-## Processing Pipeline
+## Processing Pipelines
 
-1. Audio Upload / Download
-2. Speaker Diarization
-3. Whisper Transcription
-4. Transcript Alignment
-5. Database Storage
-6. Response Generation
+**Gemini vendor**
+
+1. Resolve + (optionally) download audio, trim silence
+2. One Gemini call → diarized segments + English translation
+3. Text-only Gemini call → rubric-based score
+4. Store transcript + rating + token usage
+
+**Groq vendor**
+
+1. Resolve audio
+2. PyAnnote diarization ‖ RunPod/Whisper transcription (parallel)
+3. Transcript alignment
+4. Groq LLM scoring against the prompt
+5. Store transcript + rating
 
 ---
 
