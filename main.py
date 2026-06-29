@@ -21,12 +21,19 @@ from call_audio_pipeline import process_call_recording
 import gemini_pipeline
 import prompt_builder
 import admin_core
+import api_docs
 from fastapi.responses import HTMLResponse
 
 Base.metadata.create_all(bind=engine)
 ensure_audio_records_schema()
 
 app = FastAPI(title="Audio Transcription API")
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+def documentation_home():
+    """Friendly product documentation landing page."""
+    return HTMLResponse(api_docs.LANDING_HTML)
 
 # ---------------------------------------------------------------------------
 # Local storage dir — only used when downloading from S3 or HTTP/HTTPS URLs for Groq
