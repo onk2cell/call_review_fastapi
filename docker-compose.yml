@@ -7,15 +7,16 @@ services:
     image: postgres:16
     restart: unless-stopped
     environment:
-      POSTGRES_USER: myuser
-      POSTGRES_PASSWORD: root
-      POSTGRES_DB: call_review_db
+      POSTGRES_USER: ${POSTGRES_USER:-myuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-root}
+      POSTGRES_DB: ${POSTGRES_DB:-call_review_db}
     volumes:
       - pgdata:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"          # optional: connect with a DB GUI from the host
+    # NOTE: DB port is NOT published to the host on purpose — the app reaches it
+    # over the internal network at host "db". To inspect it from the host, add:
+    #   ports: ["5433:5432"]   (5433 to avoid clashing with a host Postgres)
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U myuser -d call_review_db"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-myuser} -d ${POSTGRES_DB:-call_review_db}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -28,7 +29,7 @@ services:
       db:
         condition: service_healthy
     ports:
-      - "8000:8000"
+      - "${APP_PORT:-8000}:8000"   # set APP_PORT in .env (e.g. 8123) to avoid host clashes
     volumes:
       - ./audio_files:/app/audio_files   # persist downloaded/temp audio
 
