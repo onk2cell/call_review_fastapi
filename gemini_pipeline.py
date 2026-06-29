@@ -197,7 +197,7 @@ def transcribe_diarize_translate(
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=RESPONSE_SCHEMA,
-            max_output_tokens=8192,
+            max_output_tokens=32768,   # high enough for long calls; guard below catches overflow
         ),
     )
 

@@ -57,6 +57,11 @@ def extract_markdown(filename: str, data: bytes) -> str:
         doc = pymupdf.open(stream=data, filetype="pdf")
         return pymupdf4llm.to_markdown(doc)
     if ext in (".md", ".markdown", ".txt"):
+        for enc in ("utf-8-sig", "utf-16", "latin-1"):
+            try:
+                return data.decode(enc)
+            except UnicodeDecodeError:
+                continue
         return data.decode("utf-8", errors="replace")
     raise ValueError(
         f"Unsupported file type '{ext}'. Allowed: {sorted(SUPPORTED_EXTS)}"

@@ -1047,9 +1047,15 @@ async def create_prompt(
     Upload a .md file to save as a prompt.
     prompt_id and index are generated automatically.
     """
-    # 1. Read the uploaded markdown file
+    # 1. Read the uploaded markdown file (robust to UTF-8/UTF-16/Windows encodings)
     content = await file.read()
-    markdown_text = content.decode("utf-8")
+    try:
+        markdown_text = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            markdown_text = content.decode("utf-16")
+        except UnicodeDecodeError:
+            markdown_text = content.decode("latin-1")
 
     # 2. Automatically generate a unique prompt_id
     unique_prompt_id = str(uuid.uuid4())
