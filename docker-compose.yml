@@ -1,0 +1,36 @@
+# ---------------------------------------------------------------------------
+# Brings up Postgres + the Call Review API together.
+#   docker compose up -d --build
+# ---------------------------------------------------------------------------
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: root
+      POSTGRES_DB: call_review_db
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"          # optional: connect with a DB GUI from the host
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myuser -d call_review_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  web:
+    build: .
+    restart: unless-stopped
+    env_file: .env           # injects GEMINI_API_KEY, GROQ_API_KEY, DATABASE_URL, etc.
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./audio_files:/app/audio_files   # persist downloaded/temp audio
+
+volumes:
+  pgdata:

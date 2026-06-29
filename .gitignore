@@ -10,3 +10,5 @@ audio_files/
 
 # Ignore Mac system files
 .DS_Store
+# Session scratch
+_demo_pid.txt

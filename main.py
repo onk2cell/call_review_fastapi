@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, Depends, BackgroundTasks, HTTPException, File, UploadFile, Form
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field, field_validator
-from typing import List, Optional
+from typing import List, Optional, Literal
 from fastapi_pagination import Page, add_pagination
 from fastapi_pagination.ext.sqlalchemy import paginate
 from fastapi_pagination import Page, Params
@@ -18,6 +18,10 @@ from fastapi_pagination import Page, Params
 from database import engine, Base, get_db, SessionLocal, ensure_audio_records_schema
 import models
 from call_audio_pipeline import process_call_recording
+import gemini_pipeline
+import prompt_builder
+import admin_core
+from fastapi.responses import HTMLResponse
 
 Base.metadata.create_all(bind=engine)
 ensure_audio_records_schema()
@@ -127,13 +131,13 @@ def _build_rating_messages(rubric: str, aligned: str, english: str) -> list[dict
 
         JSON schema you MUST follow:
         {
-            "overall_score": <integer 0-100>,
+            "overall_score": <integer 0-5>,
             "grade":         <"A" | "B" | "C" | "D" | "F">,
             "summary":       <one-sentence overall verdict>,
             "criteria": [
                 {
                     "name":     <criterion name from rubric>,
-                    "score":    <integer 0-100>,
+                    "score":    <integer 0-5>,
                     "feedback": <one or two sentences>
                 }
             ],
@@ -174,6 +178,7 @@ def _run_tvs_rating(
     aligned:  str,
     english:  str,
     rubric:   str,
+    model:    str = "llama-3.3-70b-versatile",
 ) -> dict:
     """
     Score *aligned* transcript against *rubric* using Groq LLM.
@@ -215,7 +220,7 @@ def _run_tvs_rating(
     # --- Call Groq ---
     client = Groq(api_key=groq_key)
     resp = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model=model,
         messages=messages,
         temperature=0.1,        # low temp = consistent scores
         max_tokens=1_024,       # scores are compact; no need for more
@@ -253,6 +258,14 @@ STATUS_INFO: dict[str, dict] = {
     "processing_alignment": {
         "terminal": False,
         "summary": "Aligning transcript with diarization.",
+    },
+    "processing_audio": {
+        "terminal": False,
+        "summary": "Gemini is transcribing, translating, and diarizing the call in one pass.",
+    },
+    "processing_rating": {
+        "terminal": False,
+        "summary": "Scoring the transcript against the prompt.",
     },
     "completed": {
         "terminal": True,
@@ -488,10 +501,29 @@ class AudioRequest(BaseModel):
         )
     )
     prompt_id: str
+    vendor: Optional[str] = Field(
+        default=None,
+        description="Processing vendor: 'groq' or 'gemini'. Defaults to the admin 'active_vendor' setting.",
+    )
+    gemini_model: Optional[str] = Field(
+        default=None,
+        description="Override the Gemini model for THIS request (e.g. gemini-2.5-pro). "
+                    "Else uses the admin 'gemini_model' setting / .env default.",
+    )
     notify_url: Optional[str] = Field(
         default=None,
         description="Optional webhook URL. Receives a POST when each job finishes.",
     )
+
+    @field_validator("vendor")
+    @classmethod
+    def validate_vendor(cls, v):
+        if v is None:
+            return None
+        v = v.strip().lower()
+        if v not in ("groq", "gemini"):
+            raise ValueError("vendor must be 'groq' or 'gemini'")
+        return v
 
 
 # ---------------------------------------------------------------------------
@@ -519,9 +551,11 @@ def _process_audio(audio_id: str) -> None:
             print(f"[Error] Audio record not found for ID: {audio_id}")
             return
 
-        source     = record.source_url
-        notify_url = record.notify_url
-        prompt_id  = record.prompt_id
+        source       = record.source_url
+        notify_url   = record.notify_url
+        prompt_id    = record.prompt_id
+        vendor       = (record.vendor or "groq")
+        gemini_model = record.gemini_model
 
         # ------------------------------------------------------------------
         # Step 1 — Resolve audio
@@ -557,51 +591,112 @@ def _process_audio(audio_id: str) -> None:
         # Step 2 — AI pipeline (diarization + transcription run in parallel)
         # ------------------------------------------------------------------
         try:
-            ai_results = process_call_recording(
-                audio_url  = pyannote_url,   # presigned HTTPS URL, local path, or HTTP URL
-                audio_path = audio_path,     # always a local Path for Groq
-                on_stage   = lambda st: _persist_stage(audio_id, st),
-            )
+            usage_json = None
 
-            transcript_text = ai_results.get("text", "")
-            english_translation = ai_results.get("english_translation", "")
+            if vendor == "gemini":
+                # ----- Gemini vendor: single audio call (no Pyannote / RunPod) -----
+                print(f"[INFO] [gemini] Processing audio: {audio_path} (model={gemini_model})")
+                _persist_stage(audio_id, "processing_audio")
 
-            # --- RUN TVS RATING ONCE HERE ---
-            rating_result = None
-            groq_key = os.getenv("GROQ_API_KEY", "")
-            
-            # Fetch the prompt text to use as the rubric
-            prompt_record = db.query(models.PromptRecord).filter_by(prompt_id=prompt_id).first()
-            prompt_text = prompt_record.prompt if prompt_record else None
+                gem = gemini_pipeline.transcribe_diarize_translate(
+                    audio_path, model=gemini_model
+                )
+                transcript_text     = gemini_pipeline.segments_to_text(gem["segments"])
+                english_translation = gem["english_transcript"]
+                transcript_json     = {"segments": gem["segments"]}
 
-            if groq_key and prompt_text and transcript_text:
-                try:
-                    rating_result = _run_tvs_rating(
-                        groq_key=groq_key,
-                        aligned=transcript_text,       # raw aligned transcript
-                        english=english_translation,   # english translation (can be "")
-                        rubric=prompt_text,            # prompt markdown as the rubric
-                    )
-                except FileNotFoundError as e:
-                    rating_result = {"error": f"Rubric missing: {str(e)}"}
-                except ValueError as e:
-                    rating_result = {"error": f"LLM error: {str(e)}"}
-                except Exception as e:
-                    rating_result = {"error": f"Rating failed: {str(e)}"}
+                # ----- Gemini rating: separate text-only scoring call -----
+                _persist_stage(audio_id, "processing_rating")
+                rating_result = None
+                rating_usage  = None
+
+                prompt_record = db.query(models.PromptRecord).filter_by(prompt_id=prompt_id).first()
+                prompt_text = prompt_record.prompt if prompt_record else None
+
+                if prompt_text and transcript_text:
+                    try:
+                        rate = gemini_pipeline.rate_transcript(
+                            transcript_text     = transcript_text,
+                            english_text        = english_translation,
+                            rubric              = prompt_text,
+                            model               = gemini_model,
+                        )
+                        rating_result = {"raw": rate["raw"], "data": rate["data"]}
+                        rating_usage  = rate["usage"]
+                    except Exception as e:
+                        rating_result = {"error": f"Gemini rating failed: {str(e)}"}
+                else:
+                    missing = []
+                    if not prompt_text:     missing.append("prompt")
+                    if not transcript_text: missing.append("transcript")
+                    rating_result = {"error": f"Skipped — missing: {', '.join(missing)}"}
+
+                # Combined usage: transcription + rating
+                usage_json = {
+                    "model": gem["usage"].get("model"),
+                    "transcription": gem["usage"],
+                    "rating": rating_usage,
+                    "total_cost_inr": round(
+                        gem["usage"].get("cost_inr", 0)
+                        + (rating_usage["cost_inr"] if rating_usage else 0),
+                        4,
+                    ),
+                }
+
             else:
-                missing = []
-                if not groq_key:    missing.append("GROQ_API_KEY")
-                if not prompt_text: missing.append("prompt")
-                if not transcript_text: missing.append("transcript")
-                rating_result = {"error": f"Skipped — missing: {', '.join(missing)}"}
+                # ----- Groq vendor: existing Pyannote + RunPod + Groq chain -----
+                print(f"[INFO] Processing audio: {audio_path}")
+                print(f"[INFO] Pyannote URL: {pyannote_url}")
+                ai_results = process_call_recording(
+                    audio_url  = pyannote_url,   # presigned HTTPS URL, local path, or HTTP URL
+                    audio_path = audio_path,     # always a local Path for Groq
+                    on_stage   = lambda st: _persist_stage(audio_id, st),
+                )
+
+                transcript_text     = ai_results.get("text", "")
+                english_translation = ai_results.get("english_translation", "")
+                transcript_json     = ai_results.get("combined_json", {})
+
+                # --- RUN TVS RATING ONCE HERE ---
+                rating_result = None
+                groq_key = os.getenv("GROQ_API_KEY", "")
+
+                # Fetch the prompt text to use as the rubric
+                prompt_record = db.query(models.PromptRecord).filter_by(prompt_id=prompt_id).first()
+                prompt_text = prompt_record.prompt if prompt_record else None
+
+                groq_model = admin_core.get_setting(db, "groq_model", "llama-3.3-70b-versatile")
+
+                if groq_key and prompt_text and transcript_text:
+                    try:
+                        rating_result = _run_tvs_rating(
+                            groq_key=groq_key,
+                            aligned=transcript_text,       # raw aligned transcript
+                            english=english_translation,   # english translation (can be "")
+                            rubric=prompt_text,            # prompt markdown as the rubric
+                            model=groq_model,              # admin-selected Groq model
+                        )
+                    except FileNotFoundError as e:
+                        rating_result = {"error": f"Rubric missing: {str(e)}"}
+                    except ValueError as e:
+                        rating_result = {"error": f"LLM error: {str(e)}"}
+                    except Exception as e:
+                        rating_result = {"error": f"Rating failed: {str(e)}"}
+                else:
+                    missing = []
+                    if not groq_key:    missing.append("GROQ_API_KEY")
+                    if not prompt_text: missing.append("prompt")
+                    if not transcript_text: missing.append("transcript")
+                    rating_result = {"error": f"Skipped — missing: {', '.join(missing)}"}
 
             # --- SAVE EVERYTHING TO THE DATABASE ---
             db.add(models.TranscriptResult(
                 audio_id            = audio_id,
                 transcript_text     = transcript_text,
                 english_translation = english_translation,
-                transcript_json     = ai_results.get("combined_json", {}),
+                transcript_json     = transcript_json,
                 rating_json         = rating_result,  # Saved directly to column!
+                usage_json          = usage_json,     # token counts + ₹ cost (gemini)
             ))
 
             record = db.query(models.AudioRecord).filter_by(audio_id=audio_id).first()
@@ -769,6 +864,14 @@ def process_audio(
     """
     results = []
 
+    # Resolve vendor + model once: per-request override -> admin setting -> default
+    resolved_vendor = request.vendor or admin_core.get_setting(db, "active_vendor", "groq")
+    resolved_gemini_model = None
+    if resolved_vendor == "gemini":
+        resolved_gemini_model = request.gemini_model or admin_core.get_setting(
+            db, "gemini_model", os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+        )
+
     for audio_item in request.audio_sources:
         source = audio_item.source
         custom_audio_id = audio_item.audio_id
@@ -800,12 +903,14 @@ def process_audio(
             unique_audio_id = str(uuid.uuid4())
         
         new_record = models.AudioRecord(
-            audio_id   = unique_audio_id,
-            prompt_id  = request.prompt_id,
-            source_url = source,
-            audio_path = None,        # filled in by the worker
-            status     = "pending",
-            notify_url = request.notify_url,
+            audio_id     = unique_audio_id,
+            prompt_id    = request.prompt_id,
+            source_url   = source,
+            audio_path   = None,        # filled in by the worker
+            status       = "pending",
+            notify_url   = request.notify_url,
+            vendor       = resolved_vendor,
+            gemini_model = resolved_gemini_model,
         )
         db.add(new_record)
         db.commit()
@@ -825,6 +930,8 @@ def process_audio(
             "If notify_url was set, a POST is fired when each job finishes."
         ),
         "prompt_id": request.prompt_id,
+        "vendor": resolved_vendor,
+        "gemini_model": resolved_gemini_model,
         "notify_url": request.notify_url,
         "total_items": len(results),
         "details": results,
@@ -866,11 +973,13 @@ def check_status(audio_id: str, db: Session = Depends(get_db)):
             prompt_text = prompt_record.prompt
 
     response = {
-        "audio_id":   audio_id,
-        "prompt_id":  record.prompt_id,
+        "audio_id":     audio_id,
+        "prompt_id":    record.prompt_id,
         #"prompt":     prompt_text,
-        "source_url": record.source_url,
-        "audio_path": record.audio_path,
+        "vendor":       record.vendor,
+        "gemini_model": record.gemini_model,
+        "source_url":   record.source_url,
+        "audio_path":   record.audio_path,
         **_status_payload(phase, err if phase == "failed" else None),
     }
 
@@ -890,6 +999,7 @@ def check_status(audio_id: str, db: Session = Depends(get_db)):
             
             # --- Read TVS Rating straight from the database ---
             response["rating_json"] = transcript.rating_json
+            response["usage"] = transcript.usage_json
 
     return response
 
@@ -963,13 +1073,72 @@ async def create_prompt(
     }
 
 
+@app.post("/prompts/from-file")
+async def create_prompt_from_file(
+    service_name: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """
+    Upload a PDF **or** a rubric file (.md/.txt). The file is converted to
+    markdown and Gemini drafts a structured scoring prompt from it. The result
+    is saved with status='draft' — review and approve it via PUT /prompts/{id}.
+    """
+    data = await file.read()
+
+    # 1. Extract markdown (PDF -> pymupdf4llm; .md/.txt -> decode)
+    try:
+        source_md = prompt_builder.extract_markdown(file.filename, data)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    if not source_md.strip():
+        raise HTTPException(status_code=422, detail="Could not extract any text from the file.")
+
+    # 2. Gemini drafts the scoring prompt
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    try:
+        drafted = prompt_builder.draft_prompt_from_source(
+            source_md, service_name, model=gemini_model
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Prompt drafting failed: {e}")
+
+    # 3. Save as a draft (prompt_id is stable across later edits)
+    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in (file.filename or "") else ""
+    source_type = "pdf" if ext == "pdf" else "md"
+    unique_prompt_id = str(uuid.uuid4())
+
+    new_prompt = models.PromptRecord(
+        prompt_id=unique_prompt_id,
+        prompt=drafted["prompt"],
+        service_name=service_name,
+        status="draft",
+        source=source_type,
+    )
+    db.add(new_prompt)
+    db.commit()
+    db.refresh(new_prompt)
+
+    return {
+        "message": "Draft prompt generated. Review and verify with PUT /prompts/{prompt_id}.",
+        "index": new_prompt.id,
+        "prompt_id": new_prompt.prompt_id,
+        "service_name": new_prompt.service_name,
+        "status": new_prompt.status,
+        "source": new_prompt.source,
+        "prompt": new_prompt.prompt,
+        "usage": drafted["usage"],
+    }
+
+
 @app.get("/prompts/{prompt_id}")
 def get_prompt(prompt_id: str, db: Session = Depends(get_db)):
     """
     Fetch a prompt configuration by its auto-generated prompt_id.
     """
     record = db.query(models.PromptRecord).filter(models.PromptRecord.prompt_id == prompt_id).first()
-    
+
     if not record:
         raise HTTPException(status_code=404, detail="Prompt ID not found")
 
@@ -977,7 +1146,60 @@ def get_prompt(prompt_id: str, db: Session = Depends(get_db)):
         "index": record.id,
         "prompt_id": record.prompt_id,
         "service_name": record.service_name,
+        "status": record.status,
+        "source": record.source,
         "prompt": record.prompt # Returns the raw Markdown string
+    }
+
+
+class PromptUpdate(BaseModel):
+    prompt: Optional[str] = None
+    service_name: Optional[str] = None
+    status: Optional[str] = None
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, v):
+        if v is None:
+            return v
+        v = v.strip().lower()
+        if v not in ("draft", "verified"):
+            raise ValueError("status must be one of: draft, verified")
+        return v
+
+
+@app.put("/prompts/{prompt_id}")
+def update_prompt(prompt_id: str, body: PromptUpdate, db: Session = Depends(get_db)):
+    """
+    Edit a prompt IN PLACE — the prompt_id never changes. Use this to approve a
+    draft (status='verified') and/or tweak the prompt text or service name.
+    """
+    record = db.query(models.PromptRecord).filter_by(prompt_id=prompt_id).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="Prompt ID not found")
+
+    if body.prompt is not None:
+        if not body.prompt.strip():
+            raise HTTPException(status_code=422, detail="Prompt text cannot be empty.")
+        record.prompt = body.prompt
+    if body.service_name is not None:
+        record.service_name = body.service_name
+    if body.status is not None:
+        record.status = body.status
+
+    db.commit()
+    db.refresh(record)
+
+    return {
+        "message": "Prompt updated in place.",
+        "index": record.id,
+        "prompt_id": record.prompt_id,
+        "service_name": record.service_name,
+        "status": record.status,
+        "source": record.source,
+        "prompt": record.prompt,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
     }
 
 
@@ -997,6 +1219,172 @@ def list_prompts(
     query = db.query(models.PromptRecord).order_by(models.PromptRecord.id.desc())
     
     return paginate(db, query, params)
+
+
+# ---------------------------------------------------------------------------
+# Admin section (auth via .env ADMIN_USERNAME / ADMIN_PASSWORD)
+# ---------------------------------------------------------------------------
+class SettingsUpdate(BaseModel):
+    active_vendor: Optional[str] = None
+    gemini_model: Optional[str] = None
+    groq_model: Optional[str] = None
+
+
+@app.get("/admin/models")
+def admin_models(_: str = Depends(admin_core.require_admin)):
+    """Live model catalog for the dropdowns (what the API keys can use)."""
+    return {
+        "gemini": admin_core.list_gemini_models(),
+        "groq": admin_core.list_groq_models(),
+    }
+
+
+@app.get("/admin/settings")
+def admin_get_settings(db: Session = Depends(get_db), _: str = Depends(admin_core.require_admin)):
+    return admin_core.all_settings(db)
+
+
+@app.post("/admin/settings")
+def admin_set_settings(
+    body: SettingsUpdate,
+    db: Session = Depends(get_db),
+    _: str = Depends(admin_core.require_admin),
+):
+    if body.active_vendor is not None:
+        if body.active_vendor not in ("groq", "gemini"):
+            raise HTTPException(status_code=422, detail="active_vendor must be 'groq' or 'gemini'")
+        admin_core.set_setting(db, "active_vendor", body.active_vendor)
+    if body.gemini_model is not None:
+        admin_core.set_setting(db, "gemini_model", body.gemini_model)
+    if body.groq_model is not None:
+        admin_core.set_setting(db, "groq_model", body.groq_model)
+    return admin_core.all_settings(db)
+
+
+@app.get("/admin/dashboard")
+def admin_dashboard(db: Session = Depends(get_db), _: str = Depends(admin_core.require_admin)):
+    """Aggregated usage metrics (NO cost) for the dashboard."""
+    records = db.query(models.AudioRecord).all()
+    transcripts = db.query(models.TranscriptResult).all()
+
+    jobs = {"total": len(records), "completed": 0, "failed": 0, "in_progress": 0}
+    vendors_used: dict[str, int] = {}
+    for r in records:
+        st = r.status or "unknown"
+        if st == "completed":
+            jobs["completed"] += 1
+        elif st == "failed":
+            jobs["failed"] += 1
+        else:
+            jobs["in_progress"] += 1
+        v = r.vendor or "groq"
+        vendors_used[v] = vendors_used.get(v, 0) + 1
+
+    total_in = total_out = audio_tok = 0
+    models_used: dict[str, int] = {}
+    for t in transcripts:
+        u = t.usage_json or {}
+        tr = u.get("transcription") or {}
+        rt = u.get("rating") or {}
+        audio_tok += tr.get("audio_input_tokens", 0)
+        total_in += tr.get("audio_input_tokens", 0) + (rt.get("input_tokens", 0) or 0)
+        total_out += tr.get("output_tokens", 0) + (rt.get("output_tokens", 0) or 0)
+        m = u.get("model")
+        if m:
+            models_used[m] = models_used.get(m, 0) + 1
+
+    return {
+        "jobs": jobs,
+        "vendors_used": vendors_used,
+        "models_used": models_used,
+        "total_call_minutes": round(audio_tok / 32 / 60, 2),  # from audio tokens (32/sec)
+        "tokens": {"input": total_in, "output": total_out, "total": total_in + total_out},
+        "active_settings": admin_core.all_settings(db),
+        "note": "Metrics from tracked (Gemini) usage. For billing, see Google AI Studio.",
+    }
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page(_: str = Depends(admin_core.require_admin)):
+    return HTMLResponse(_ADMIN_HTML)
+
+
+_ADMIN_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Call Review — Admin</title>
+<style>
+ body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:0;background:#0f172a;color:#e2e8f0}
+ .wrap{max-width:880px;margin:0 auto;padding:24px}
+ h1{font-size:20px;margin:0 0 4px} .sub{color:#94a3b8;font-size:13px;margin-bottom:20px}
+ .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px}
+ .card{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:16px}
+ .card .k{color:#94a3b8;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+ .card .v{font-size:26px;font-weight:600;margin-top:6px}
+ .panel{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:18px;margin-bottom:18px}
+ label{display:block;font-size:13px;color:#cbd5e1;margin:10px 0 4px}
+ select,button{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#e2e8f0}
+ button{background:#2563eb;border-color:#2563eb;cursor:pointer;font-weight:600;margin-top:14px}
+ button:hover{background:#1d4ed8}
+ .muted{color:#94a3b8;font-size:12px} a{color:#60a5fa}
+ table{width:100%;border-collapse:collapse;font-size:13px} td{padding:4px 0;border-bottom:1px solid #334155}
+ #msg{font-size:13px;margin-left:10px}
+</style></head>
+<body><div class="wrap">
+ <h1>Call Review — Admin</h1>
+ <div class="sub">Usage dashboard &amp; model selection</div>
+
+ <div class="cards" id="cards"></div>
+
+ <div class="panel">
+  <h3 style="margin:0 0 6px">Model selection</h3>
+  <label>Active vendor</label>
+  <select id="vendor"><option value="groq">groq</option><option value="gemini">gemini</option></select>
+  <label>Gemini model</label><select id="gmodel"></select>
+  <label>Groq model</label><select id="qmodel"></select>
+  <div><button onclick="save()">Save</button><span id="msg"></span></div>
+ </div>
+
+ <div class="panel">
+  <h3 style="margin:0 0 6px">Breakdown</h3>
+  <table id="breakdown"></table>
+  <p class="muted" id="note"></p>
+  <p class="muted">Billing is not shown here — view actual spend in
+   <a href="https://aistudio.google.com/app/billing" target="_blank">Google AI Studio Billing</a>.</p>
+ </div>
+</div>
+<script>
+async function jget(u){const r=await fetch(u,{credentials:'same-origin'});return r.json();}
+function opt(sel,items,cur){sel.innerHTML='';items.forEach(m=>{const o=document.createElement('option');
+  o.value=m.id;o.textContent=m.label||m.id;if(m.id===cur)o.selected=true;sel.appendChild(o);});}
+async function load(){
+ const [d,models,s]=await Promise.all([jget('/admin/dashboard'),jget('/admin/models'),jget('/admin/settings')]);
+ // cards
+ const c=document.getElementById('cards');
+ const cards=[['Total calls',d.jobs.total],['Completed',d.jobs.completed],['Failed',d.jobs.failed],
+   ['Call minutes',d.total_call_minutes],['Input tokens',d.tokens.input.toLocaleString()],
+   ['Output tokens',d.tokens.output.toLocaleString()]];
+ c.innerHTML=cards.map(x=>`<div class="card"><div class="k">${x[0]}</div><div class="v">${x[1]}</div></div>`).join('');
+ // selectors
+ document.getElementById('vendor').value=s.active_vendor;
+ opt(document.getElementById('gmodel'),models.gemini,s.gemini_model);
+ opt(document.getElementById('qmodel'),models.groq,s.groq_model);
+ // breakdown
+ const rows=[];
+ rows.push(['Vendors used',Object.entries(d.vendors_used).map(e=>e[0]+': '+e[1]).join(', ')||'-']);
+ rows.push(['Models used',Object.entries(d.models_used).map(e=>e[0]+': '+e[1]).join(', ')||'-']);
+ document.getElementById('breakdown').innerHTML=rows.map(r=>`<tr><td>${r[0]}</td><td style="text-align:right">${r[1]}</td></tr>`).join('');
+ document.getElementById('note').textContent=d.note||'';
+}
+async function save(){
+ const body={active_vendor:document.getElementById('vendor').value,
+   gemini_model:document.getElementById('gmodel').value,
+   groq_model:document.getElementById('qmodel').value};
+ const r=await fetch('/admin/settings',{method:'POST',credentials:'same-origin',
+   headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+ document.getElementById('msg').textContent=r.ok?'✓ saved':'✗ error';
+ setTimeout(()=>document.getElementById('msg').textContent='',2000);
+}
+load();
+</script></body></html>"""
 
 
 # Initialize fastapi-pagination

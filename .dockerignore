@@ -1,0 +1,11 @@
+# Keep the image small and secrets out of it
+.env
+venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+audio_files/
+*.wav
+*.mp3
+README.md
