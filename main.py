@@ -605,8 +605,12 @@ def _process_audio(audio_id: str) -> None:
                 print(f"[INFO] [gemini] Processing audio: {audio_path} (model={gemini_model})")
                 _persist_stage(audio_id, "processing_audio")
 
+                try:
+                    max_out = int(admin_core.get_setting(db, "max_output_tokens", "32768") or 32768)
+                except (TypeError, ValueError):
+                    max_out = 32768
                 gem = gemini_pipeline.transcribe_diarize_translate(
-                    audio_path, model=gemini_model
+                    audio_path, model=gemini_model, max_output_tokens=max_out
                 )
                 transcript_text     = gemini_pipeline.segments_to_text(gem["segments"])
                 english_translation = gem["english_transcript"]
@@ -1241,6 +1245,7 @@ class SettingsUpdate(BaseModel):
     active_vendor: Optional[str] = None
     gemini_model: Optional[str] = None
     groq_model: Optional[str] = None
+    max_output_tokens: Optional[int] = None
 
 
 @app.get("/admin/models")
@@ -1271,6 +1276,10 @@ def admin_set_settings(
         admin_core.set_setting(db, "gemini_model", body.gemini_model)
     if body.groq_model is not None:
         admin_core.set_setting(db, "groq_model", body.groq_model)
+    if body.max_output_tokens is not None:
+        if not (256 <= body.max_output_tokens <= 65536):
+            raise HTTPException(status_code=422, detail="max_output_tokens must be between 256 and 65536")
+        admin_core.set_setting(db, "max_output_tokens", str(body.max_output_tokens))
     return admin_core.all_settings(db)
 
 
@@ -1353,6 +1362,9 @@ _ADMIN_HTML = """<!doctype html>
   <select id="vendor"><option value="groq">groq</option><option value="gemini">gemini</option></select>
   <label>Gemini model</label><select id="gmodel"></select>
   <label>Groq model</label><select id="qmodel"></select>
+  <label>Max output tokens (Gemini transcript cap, 256&ndash;65536)</label>
+  <input id="maxtok" type="number" min="256" max="65536" step="256"
+    style="font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;width:200px">
   <div><button onclick="save()">Save</button><span id="msg"></span></div>
  </div>
 
@@ -1380,6 +1392,7 @@ async function load(){
  document.getElementById('vendor').value=s.active_vendor;
  opt(document.getElementById('gmodel'),models.gemini,s.gemini_model);
  opt(document.getElementById('qmodel'),models.groq,s.groq_model);
+ document.getElementById('maxtok').value=s.max_output_tokens;
  // breakdown
  const rows=[];
  rows.push(['Vendors used',Object.entries(d.vendors_used).map(e=>e[0]+': '+e[1]).join(', ')||'-']);
@@ -1390,7 +1403,8 @@ async function load(){
 async function save(){
  const body={active_vendor:document.getElementById('vendor').value,
    gemini_model:document.getElementById('gmodel').value,
-   groq_model:document.getElementById('qmodel').value};
+   groq_model:document.getElementById('qmodel').value,
+   max_output_tokens:parseInt(document.getElementById('maxtok').value)};
  const r=await fetch('/admin/settings',{method:'POST',credentials:'same-origin',
    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
  document.getElementById('msg').textContent=r.ok?'✓ saved':'✗ error';

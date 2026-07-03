@@ -161,6 +161,7 @@ def transcribe_diarize_translate(
     model: str | None = None,
     trim_silence: bool = True,
     api_key: str | None = None,
+    max_output_tokens: int = 32768,
 ) -> dict[str, Any]:
     """
     Run the single Gemini audio call. Returns:
@@ -197,7 +198,7 @@ def transcribe_diarize_translate(
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=RESPONSE_SCHEMA,
-            max_output_tokens=32768,   # high enough for long calls; guard below catches overflow
+            max_output_tokens=max_output_tokens,   # admin-configurable; guard below catches overflow
         ),
     )
 
