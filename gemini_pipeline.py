@@ -165,6 +165,14 @@ class PrimaryModelOverloaded(Exception):
     """Primary model still 503 after all retries (fallback not allowed here)."""
 
 
+class TranscriptRunaway(PrimaryModelOverloaded):
+    """
+    Transcription hit MAX_TOKENS twice (degenerate generation loop on this
+    audio). Subclasses PrimaryModelOverloaded so callers route to the
+    rating-only fallback and the client still gets a scorecard.
+    """
+
+
 def _is_overloaded(exc: Exception) -> bool:
     s = str(exc)
     return "503" in s or "UNAVAILABLE" in s or "overloaded" in s.lower()
@@ -264,15 +272,23 @@ def transcribe_diarize_translate(
     # path on the fallback model instead of paying for a full transcript.
     response, model = _generate_with_retry(client, model, contents, config, allow_fallback=False)
 
-    # Guard: stopping at the output cap means truncated JSON. On a normal call
-    # this is almost always a degenerate repetition loop — regenerate once
-    # before failing with a clear message.
+    # Guard: stopping at the output cap means truncated JSON — on a normal call
+    # this is a degenerate repetition loop. Regenerating at temperature 0 would
+    # deterministically reproduce the same runaway, so regenerate once at a
+    # HIGHER temperature to break the loop.
     if _finish_is_max(response):
-        response, model = _generate_with_retry(client, model, contents, config, allow_fallback=False)
+        retry_config = types.GenerateContentConfig(
+            temperature=0.7,
+            response_mime_type="application/json",
+            response_schema=RESPONSE_SCHEMA,
+            max_output_tokens=max_output_tokens,
+        )
+        response, model = _generate_with_retry(client, model, contents, retry_config, allow_fallback=False)
         if _finish_is_max(response):
-            raise ValueError(
-                "Gemini hit the output-token cap (MAX_TOKENS) — transcript too long. "
-                "Raise max_output_tokens or split the audio."
+            # Persistent runaway on this audio — escalate so the caller uses
+            # the rating-only fallback (client still gets a scorecard).
+            raise TranscriptRunaway(
+                "Transcription hit MAX_TOKENS twice (degenerate generation loop)."
             )
 
     data = json.loads(response.text)

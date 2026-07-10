@@ -154,6 +154,53 @@ except Exception:
     check("4a raises when fallback overloaded too", True)
 
 # ---------------------------------------------------------------------------
+# 5. Degenerate runaway (MAX_TOKENS) handling
+# ---------------------------------------------------------------------------
+class MaxTokFakeModels:
+    """finish_seq: finish_reason per successive call, e.g. ["MAX_TOKENS","STOP"]."""
+    def __init__(self, payload, finish_seq):
+        self.payload = payload
+        self.finish_seq = list(finish_seq)
+        self.configs = []
+        self.n = 0
+
+    def generate_content(self, model, contents, config):
+        self.configs.append(config)
+        fr = self.finish_seq[min(self.n, len(self.finish_seq) - 1)]
+        self.n += 1
+        resp = FakeResponse(self.payload)
+        resp.candidates[0].finish_reason = fr
+        return resp
+
+
+# 5a: first generation runs away (MAX_TOKENS), regen at temp 0.7 succeeds
+m = MaxTokFakeModels(TRANSCRIPT_PAYLOAD, ["MAX_TOKENS", "STOP"])
+gp.genai.Client = fake_client_factory(m)
+r = gp.transcribe_diarize_translate(AUDIO, model="gemini-2.5-flash-lite",
+                                    trim_silence=False, api_key="test")
+check("5a runaway then regen succeeds", len(r["segments"]) == 2)
+check("5b regen used temperature 0.7",
+      getattr(m.configs[1], "temperature", None) == 0.7,
+      f"temp={getattr(m.configs[1], 'temperature', None)}")
+check("5c first attempt used temperature 0",
+      getattr(m.configs[0], "temperature", None) == 0)
+
+# 5d: persistent runaway -> TranscriptRunaway (routes to rating-only in main)
+m = MaxTokFakeModels(TRANSCRIPT_PAYLOAD, ["MAX_TOKENS", "MAX_TOKENS"])
+gp.genai.Client = fake_client_factory(m)
+try:
+    gp.transcribe_diarize_translate(AUDIO, model="gemini-2.5-flash-lite",
+                                    trim_silence=False, api_key="test")
+    check("5d persistent runaway raises TranscriptRunaway", False, "no exception")
+except gp.TranscriptRunaway:
+    check("5d persistent runaway raises TranscriptRunaway", True)
+check("5e TranscriptRunaway routes like overload (subclass)",
+      issubclass(gp.TranscriptRunaway, gp.PrimaryModelOverloaded))
+
+# fix shared FakeCand state (5a/5d mutate the class-level candidate)
+FakeCand.finish_reason = "STOP"
+
+# ---------------------------------------------------------------------------
 AUDIO.unlink(missing_ok=True)
 print()
 if FAILURES:
