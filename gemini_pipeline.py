@@ -216,7 +216,7 @@ def transcribe_diarize_translate(
     model: str | None = None,
     trim_silence: bool = True,
     api_key: str | None = None,
-    max_output_tokens: int = 32768,
+    max_output_tokens: int = 65536,
 ) -> dict[str, Any]:
     """
     Run the single Gemini audio call. Returns:

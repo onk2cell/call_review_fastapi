@@ -26,7 +26,7 @@ DEFAULTS: dict[str, str] = {
     "active_vendor": "groq",
     "gemini_model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"),
     "groq_model": "llama-3.3-70b-versatile",
-    "max_output_tokens": "32768",   # Gemini transcription output cap
+    "max_output_tokens": "65536",   # Gemini transcription output cap (model max)
 }
 
 
