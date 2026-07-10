@@ -161,15 +161,22 @@ FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
 _RETRY_DELAYS = (2, 5, 10)  # seconds between attempts on 503
 
 
+class PrimaryModelOverloaded(Exception):
+    """Primary model still 503 after all retries (fallback not allowed here)."""
+
+
 def _is_overloaded(exc: Exception) -> bool:
     s = str(exc)
     return "503" in s or "UNAVAILABLE" in s or "overloaded" in s.lower()
 
 
-def _generate_with_retry(client, model: str, contents, config):
+def _generate_with_retry(client, model: str, contents, config, allow_fallback: bool = True):
     """
-    Call generate_content with retries on 503/UNAVAILABLE, then one fallback
-    model attempt. Returns (response, model_actually_used).
+    Call generate_content with retries on 503/UNAVAILABLE.
+    - allow_fallback=True: after retries, try FALLBACK_MODEL once.
+    - allow_fallback=False: after retries, raise PrimaryModelOverloaded so the
+      caller can switch to a cheaper strategy (e.g. rating-only, no transcript).
+    Returns (response, model_actually_used).
     """
     import time as _time
 
@@ -185,6 +192,9 @@ def _generate_with_retry(client, model: str, contents, config):
             if not _is_overloaded(e):
                 raise
             last_exc = e
+
+    if not allow_fallback:
+        raise PrimaryModelOverloaded(str(last_exc))
 
     # Still overloaded — try the fallback model once (if it's different)
     if FALLBACK_MODEL and FALLBACK_MODEL != model:
@@ -249,13 +259,16 @@ def transcribe_diarize_translate(
         cand = (resp.candidates or [None])[0]
         return "MAX_TOKENS" in str(getattr(cand, "finish_reason", ""))
 
-    response, model = _generate_with_retry(client, model, contents, config)
+    # No silent fallback here: if the primary model is overloaded, raise
+    # PrimaryModelOverloaded so the caller can use the cheaper rating-only
+    # path on the fallback model instead of paying for a full transcript.
+    response, model = _generate_with_retry(client, model, contents, config, allow_fallback=False)
 
     # Guard: stopping at the output cap means truncated JSON. On a normal call
     # this is almost always a degenerate repetition loop — regenerate once
     # before failing with a clear message.
     if _finish_is_max(response):
-        response, model = _generate_with_retry(client, model, contents, config)
+        response, model = _generate_with_retry(client, model, contents, config, allow_fallback=False)
         if _finish_is_max(response):
             raise ValueError(
                 "Gemini hit the output-token cap (MAX_TOKENS) — transcript too long. "
@@ -390,6 +403,98 @@ def rate_transcript(
         "data": data,
         "usage": {
             "input_tokens": in_tok,
+            "output_tokens": out_tok,
+            "total_tokens": in_tok + out_tok,
+            "cost_inr": round(cost_inr, 4),
+            "model": model,
+        },
+    }
+
+
+RATING_ONLY_SYSTEM = """You are a strict, objective call-quality scorer.
+
+Listen to the attached call recording (it may be in Hindi, Marathi, Hinglish or
+English). It is a TVS lead-qualification call with two speakers: the AGENT (TVS
+representative) and the CUSTOMER. Evaluate the AGENT against every criterion in
+the RUBRIC below. Do NOT write a transcript — output ONLY the score JSON.
+
+Scoring scale (MUST follow exactly):
+- Each criterion "score" is an integer 0-5.
+- "overall_score" is an integer 0-5 — the ROUNDED AVERAGE of the criteria
+  scores. It is NOT a sum and must never exceed 5.
+- "grade" maps from overall_score: A (5), B (4), C (3), D (2), F (0-1).
+
+Return ONLY the JSON object matching the provided schema — no prose, no
+markdown fences. If the audio has no usable conversation, set overall_score to
+0 and explain in summary.
+"""
+
+
+def rate_audio_only(
+    audio_path: str | Path,
+    rubric: str,
+    model: str | None = None,
+    api_key: str | None = None,
+    trim_silence: bool = True,
+) -> dict[str, Any]:
+    """
+    Cost-saving fallback: ONE call that listens to the audio and returns ONLY
+    the rating JSON (no transcript generated -> far fewer output tokens).
+    Used when the cheap primary model is overloaded and we must run on the
+    pricier fallback model. Returns {"raw", "data", "usage"}.
+    """
+    rubric = (rubric or "").strip()
+    if not rubric:
+        raise ValueError("Rubric (prompt) is empty.")
+
+    audio_path = Path(audio_path)
+    if not audio_path.exists():
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+    model = model or FALLBACK_MODEL
+    api_key = api_key or os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("Set GEMINI_API_KEY (env var) or pass api_key=...")
+
+    fmt = audio_path.suffix.lstrip(".").lower() or "mp3"
+    audio_bytes = audio_path.read_bytes()
+    if trim_silence:
+        audio_bytes, mime_type = _maybe_trim_silence(audio_bytes, fmt)
+    else:
+        mime_type = mimetypes.guess_type(str(audio_path))[0] or "audio/mpeg"
+
+    client = genai.Client(api_key=api_key)
+    response, model = _generate_with_retry(
+        client,
+        model,
+        contents=[
+            RATING_ONLY_SYSTEM + "\n## RUBRIC\n" + rubric,
+            types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+        ],
+        config=types.GenerateContentConfig(
+            temperature=0,
+            response_mime_type="application/json",
+            response_schema=RATING_SCHEMA,
+        ),
+        allow_fallback=True,  # already on the fallback path; let it try others
+    )
+
+    raw = response.text
+    data = json.loads(raw)
+
+    usage = response.usage_metadata
+    in_tok = usage.prompt_token_count or 0
+    out_tok = (usage.candidates_token_count or 0) + (
+        getattr(usage, "thoughts_token_count", 0) or 0
+    )
+    price = PRICING.get(model, PRICING[DEFAULT_MODEL])
+    cost_inr = _cost_inr(in_tok, out_tok, price["audio_input"], price["output"])
+
+    return {
+        "raw": raw,
+        "data": data,
+        "usage": {
+            "audio_input_tokens": in_tok,
             "output_tokens": out_tok,
             "total_tokens": in_tok + out_tok,
             "cost_inr": round(cost_inr, 4),

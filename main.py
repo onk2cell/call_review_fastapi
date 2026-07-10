@@ -618,50 +618,81 @@ def _process_audio(audio_id: str, startup_delay: float = 0.0) -> None:
                     max_out = int(admin_core.get_setting(db, "max_output_tokens", "32768") or 32768)
                 except (TypeError, ValueError):
                     max_out = 32768
-                gem = gemini_pipeline.transcribe_diarize_translate(
-                    audio_path, model=gemini_model, max_output_tokens=max_out
-                )
-                transcript_text     = gemini_pipeline.segments_to_text(gem["segments"])
-                english_translation = gem["english_transcript"]
-                transcript_json     = {"segments": gem["segments"]}
-
-                # ----- Gemini rating: separate text-only scoring call -----
-                _persist_stage(audio_id, "processing_rating")
-                rating_result = None
-                rating_usage  = None
 
                 prompt_record = db.query(models.PromptRecord).filter_by(prompt_id=prompt_id).first()
                 prompt_text = prompt_record.prompt if prompt_record else None
 
-                if prompt_text and transcript_text:
-                    try:
-                        rate = gemini_pipeline.rate_transcript(
-                            transcript_text     = transcript_text,
-                            english_text        = english_translation,
-                            rubric              = prompt_text,
-                            model               = gemini_model,
-                        )
-                        rating_result = {"raw": rate["raw"], "data": rate["data"]}
-                        rating_usage  = rate["usage"]
-                    except Exception as e:
-                        rating_result = {"error": f"Gemini rating failed: {str(e)}"}
-                else:
-                    missing = []
-                    if not prompt_text:     missing.append("prompt")
-                    if not transcript_text: missing.append("transcript")
-                    rating_result = {"error": f"Skipped — missing: {', '.join(missing)}"}
+                try:
+                    # ----- Normal path: transcript on the (cheap) primary model -----
+                    gem = gemini_pipeline.transcribe_diarize_translate(
+                        audio_path, model=gemini_model, max_output_tokens=max_out
+                    )
+                    transcript_text     = gemini_pipeline.segments_to_text(gem["segments"])
+                    english_translation = gem["english_transcript"]
+                    transcript_json     = {"segments": gem["segments"]}
 
-                # Combined usage: transcription + rating
-                usage_json = {
-                    "model": gem["usage"].get("model"),
-                    "transcription": gem["usage"],
-                    "rating": rating_usage,
-                    "total_cost_inr": round(
-                        gem["usage"].get("cost_inr", 0)
-                        + (rating_usage["cost_inr"] if rating_usage else 0),
-                        4,
-                    ),
-                }
+                    # ----- Rating: separate text-only scoring call -----
+                    _persist_stage(audio_id, "processing_rating")
+                    rating_result = None
+                    rating_usage  = None
+
+                    if prompt_text and transcript_text:
+                        try:
+                            rate = gemini_pipeline.rate_transcript(
+                                transcript_text     = transcript_text,
+                                english_text        = english_translation,
+                                rubric              = prompt_text,
+                                model               = gemini_model,
+                            )
+                            rating_result = {"raw": rate["raw"], "data": rate["data"]}
+                            rating_usage  = rate["usage"]
+                        except Exception as e:
+                            rating_result = {"error": f"Gemini rating failed: {str(e)}"}
+                    else:
+                        missing = []
+                        if not prompt_text:     missing.append("prompt")
+                        if not transcript_text: missing.append("transcript")
+                        rating_result = {"error": f"Skipped — missing: {', '.join(missing)}"}
+
+                    usage_json = {
+                        "mode": "full",
+                        "model": gem["usage"].get("model"),
+                        "transcription": gem["usage"],
+                        "rating": rating_usage,
+                        "total_cost_inr": round(
+                            gem["usage"].get("cost_inr", 0)
+                            + (rating_usage["cost_inr"] if rating_usage else 0),
+                            4,
+                        ),
+                    }
+
+                except gemini_pipeline.PrimaryModelOverloaded:
+                    # ----- Cost-saving fallback: primary model overloaded. -----
+                    # One audio->rating call on the fallback model; NO transcript
+                    # is generated (saves output tokens on the pricier model).
+                    print(f"[INFO] [gemini] {gemini_model} overloaded — rating-only fallback for {audio_id}")
+                    if not prompt_text:
+                        raise ValueError(
+                            f"Model '{gemini_model}' is overloaded and no prompt is "
+                            "available for the rating-only fallback."
+                        )
+                    _persist_stage(audio_id, "processing_rating")
+                    rate = gemini_pipeline.rate_audio_only(audio_path, rubric=prompt_text)
+                    transcript_text     = ""
+                    english_translation = ""
+                    transcript_json     = {
+                        "segments": [],
+                        "note": "Transcript skipped: primary model overloaded; "
+                                "rating-only fallback used to save tokens.",
+                    }
+                    rating_result = {"raw": rate["raw"], "data": rate["data"]}
+                    usage_json = {
+                        "mode": "rating_only",
+                        "model": rate["usage"].get("model"),
+                        "transcription": None,
+                        "rating": rate["usage"],
+                        "total_cost_inr": rate["usage"].get("cost_inr", 0),
+                    }
 
             else:
                 # ----- Groq vendor: existing Pyannote + RunPod + Groq chain -----
@@ -1323,8 +1354,13 @@ def admin_dashboard(db: Session = Depends(get_db), _: str = Depends(admin_core.r
         u = t.usage_json or {}
         tr = u.get("transcription") or {}
         rt = u.get("rating") or {}
-        audio_tok += tr.get("audio_input_tokens", 0)
-        total_in += tr.get("audio_input_tokens", 0) + (rt.get("input_tokens", 0) or 0)
+        # rating-only fallback jobs carry their audio tokens under "rating"
+        audio_tok += tr.get("audio_input_tokens", 0) + (rt.get("audio_input_tokens", 0) or 0)
+        total_in += (
+            tr.get("audio_input_tokens", 0)
+            + (rt.get("input_tokens", 0) or 0)
+            + (rt.get("audio_input_tokens", 0) or 0)
+        )
         total_out += tr.get("output_tokens", 0) + (rt.get("output_tokens", 0) or 0)
         m = u.get("model")
         if m:
