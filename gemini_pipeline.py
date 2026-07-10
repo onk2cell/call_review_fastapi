@@ -234,29 +234,33 @@ def transcribe_diarize_translate(
         mime_type = mimetypes.guess_type(str(audio_path))[0] or "audio/mpeg"
 
     client = genai.Client(api_key=api_key)
-    response, model = _generate_with_retry(
-        client,
-        model,
-        contents=[
-            TRANSCRIBE_PROMPT,
-            types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
-        ],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=RESPONSE_SCHEMA,
-            max_output_tokens=max_output_tokens,   # admin-configurable; guard below catches overflow
-        ),
+    contents = [
+        TRANSCRIBE_PROMPT,
+        types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+    ]
+    config = types.GenerateContentConfig(
+        temperature=0,  # deterministic; prevents degenerate/runaway generations
+        response_mime_type="application/json",
+        response_schema=RESPONSE_SCHEMA,
+        max_output_tokens=max_output_tokens,   # admin-configurable; guard below catches overflow
     )
 
-    # Guard: if the model stopped at the output cap, the JSON is truncated.
-    # Fail with a clear message instead of a cryptic "Unterminated string".
-    cand = (response.candidates or [None])[0]
-    finish = getattr(cand, "finish_reason", None)
-    if finish is not None and "MAX_TOKENS" in str(finish):
-        raise ValueError(
-            "Gemini hit the output-token cap (MAX_TOKENS) — transcript too long. "
-            "Raise max_output_tokens or split the audio."
-        )
+    def _finish_is_max(resp) -> bool:
+        cand = (resp.candidates or [None])[0]
+        return "MAX_TOKENS" in str(getattr(cand, "finish_reason", ""))
+
+    response, model = _generate_with_retry(client, model, contents, config)
+
+    # Guard: stopping at the output cap means truncated JSON. On a normal call
+    # this is almost always a degenerate repetition loop — regenerate once
+    # before failing with a clear message.
+    if _finish_is_max(response):
+        response, model = _generate_with_retry(client, model, contents, config)
+        if _finish_is_max(response):
+            raise ValueError(
+                "Gemini hit the output-token cap (MAX_TOKENS) — transcript too long. "
+                "Raise max_output_tokens or split the audio."
+            )
 
     data = json.loads(response.text)
 

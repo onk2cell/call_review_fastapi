@@ -537,7 +537,12 @@ class AudioRequest(BaseModel):
 # Background worker
 # ---------------------------------------------------------------------------
 
-def _process_audio(audio_id: str) -> None:
+# Pause between jobs of the same batch so Gemini calls are paced, not bursty
+# (bursts trigger 503 "model overloaded"). Configurable via env.
+JOB_STAGGER_SECONDS = float(os.getenv("JOB_STAGGER_SECONDS", "5"))
+
+
+def _process_audio(audio_id: str, startup_delay: float = 0.0) -> None:
     """
     Background task per audio_id:
       1. Resolve audio source:
@@ -549,6 +554,10 @@ def _process_audio(audio_id: str) -> None:
       4. Run TVS Rating with LLM and persist transcript/rating.
       5. Fire webhook.
     """
+    if startup_delay > 0:
+        import time
+        time.sleep(startup_delay)
+
     db = SessionLocal()
     tmp_path: Path | None = None  # track temp downloads for cleanup
 
@@ -926,7 +935,13 @@ def process_audio(
         db.add(new_record)
         db.commit()
 
-        background_tasks.add_task(_process_audio, unique_audio_id)
+        # Jobs in a batch run sequentially; every job after the first waits a
+        # fixed gap before starting so Gemini calls are paced, not bursty.
+        queued = sum(1 for r in results if "error" not in r)
+        background_tasks.add_task(
+            _process_audio, unique_audio_id,
+            startup_delay=JOB_STAGGER_SECONDS if queued else 0.0,
+        )
 
         results.append({
             "source": source,
