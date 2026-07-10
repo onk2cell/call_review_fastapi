@@ -154,6 +154,51 @@ def _maybe_trim_silence(audio_bytes: bytes, fmt: str) -> tuple[bytes, str]:
 
 
 # ---------------------------------------------------------------------------
+# Resilient Gemini call: retry on 503/overload, then fall back to a stronger
+# model once. Keeps transient Google-side capacity errors from failing jobs.
+# ---------------------------------------------------------------------------
+FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
+_RETRY_DELAYS = (2, 5, 10)  # seconds between attempts on 503
+
+
+def _is_overloaded(exc: Exception) -> bool:
+    s = str(exc)
+    return "503" in s or "UNAVAILABLE" in s or "overloaded" in s.lower()
+
+
+def _generate_with_retry(client, model: str, contents, config):
+    """
+    Call generate_content with retries on 503/UNAVAILABLE, then one fallback
+    model attempt. Returns (response, model_actually_used).
+    """
+    import time as _time
+
+    last_exc: Exception | None = None
+    for delay in (0, *_RETRY_DELAYS):
+        if delay:
+            _time.sleep(delay)
+        try:
+            return client.models.generate_content(
+                model=model, contents=contents, config=config
+            ), model
+        except Exception as e:
+            if not _is_overloaded(e):
+                raise
+            last_exc = e
+
+    # Still overloaded — try the fallback model once (if it's different)
+    if FALLBACK_MODEL and FALLBACK_MODEL != model:
+        try:
+            return client.models.generate_content(
+                model=FALLBACK_MODEL, contents=contents, config=config
+            ), FALLBACK_MODEL
+        except Exception as e:
+            last_exc = e
+
+    raise last_exc  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
 # Core
 # ---------------------------------------------------------------------------
 def transcribe_diarize_translate(
@@ -189,8 +234,9 @@ def transcribe_diarize_translate(
         mime_type = mimetypes.guess_type(str(audio_path))[0] or "audio/mpeg"
 
     client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model,
+    response, model = _generate_with_retry(
+        client,
+        model,
         contents=[
             TRANSCRIBE_PROMPT,
             types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
@@ -313,8 +359,9 @@ def rate_transcript(
     user += "\n\nScore the AGENT against the rubric and return only the JSON object."
 
     client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model,
+    response, model = _generate_with_retry(
+        client,
+        model,
         contents=[RATING_SYSTEM, user],
         config=types.GenerateContentConfig(
             temperature=0,  # consistent scores
